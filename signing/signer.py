@@ -9,7 +9,11 @@ from typing import Any
 
 from eth_account import Account
 from eth_account.signers.local import LocalAccount
-from hyperliquid.utils.signing import sign_l1_action as hl_sign_l1_action
+from hyperliquid.utils.signing import (
+    sign_l1_action as hl_sign_l1_action,
+    sign_usd_class_transfer_action,
+    sign_withdraw_from_bridge_action,
+)
 
 from signing.env import hyperliquid_signing_is_mainnet
 
@@ -39,9 +43,8 @@ class SigningModule:
         return self._account.address
 
     @property
-    def wallet(self) -> LocalAccount:
-        """Underlying signer for SDK `Exchange` (same key material as address)."""
-        return self._account
+    def expires_after(self) -> int | None:
+        return self._expires_after
 
     def sign_l1_action(
         self,
@@ -57,3 +60,9 @@ class SigningModule:
             self._expires_after,
             self._is_mainnet,
         )
+
+    def sign_usd_class_transfer_action(self, action: dict[str, Any]) -> Any:
+        return sign_usd_class_transfer_action(self._account, action, self._is_mainnet)
+
+    def sign_withdraw_from_bridge_action(self, action: dict[str, Any]) -> Any:
+        return sign_withdraw_from_bridge_action(self._account, action, self._is_mainnet)

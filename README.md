@@ -39,12 +39,12 @@ Trading and withdrawals can move **real funds**. Prefer **testnet** first (`HYPE
 |------|------------|
 | **Secrets** | Load `PRIVATE_KEY` from `.env` only (never the database). |
 | **Network** | All API URLs and deposit metadata from `.env` (`signing/env.py`, `signing/required_env.py`); no hardcoded hosts in application code. |
-| **Signing** | `SigningModule` wraps EIP-712 L1 actions for use with the SDK or tests. |
+| **Signing** | `SigningModule` is a pure signing boundary: service code sends signable messages in, receives signatures out. |
 | **Wallet / deposits** | `wallet_info` + `trading/deposit_info.py` (address + Arbitrum/USDC guidance; no bridge contract addresses in-repo). |
 | **Balances** | `account_balances` / `InfoClient.get_account_balances()` — perp + spot breakdown. |
 | **Spot ↔ perp** | `transfer_usd_class` / `ExchangeClient.usd_class_transfer`. |
 | **Read-only** | `InfoClient`: positions, orders, fills, deposits (ledger), spot state, snapshots. |
-| **Trading** | `ExchangeClient`: limit/market orders, cancel; `trade_history` reports with optional fill %. |
+| **Trading** | `ExchangeClient`: build action payload -> ask `SigningModule` to sign -> submit `/exchange`; plus trade history with optional fill %. |
 | **Withdraw** | `withdraw` (dry-run default) / `ExchangeClient.withdraw_to_wallet`. |
 | **Admin** | Optional `TradingAccount` labels (no secrets). |
 | **Regression tests** | `scripts/test_phase1.py` … `test_phase4.py` validate each layer (Phase 4: withdraw dry-run + real-money guard). |
