@@ -1,3 +1,4 @@
+"""ASGI entry for async servers (e.g. uvicorn)."""
 import os
 
 from django.core.asgi import get_asgi_application

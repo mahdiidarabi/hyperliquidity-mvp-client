@@ -53,8 +53,10 @@ Hyperliquid API
 │   ├── models.py                # TradingAccount (metadata only)
 │   ├── admin.py
 │   ├── services/
-│   │   └── info_client.py       # InfoClient (read-only /info)
-│   └── management/commands/     # smoke_signing, info_snapshot
+│   │   ├── info_client.py       # InfoClient (read-only /info)
+│   │   ├── exchange_client.py   # ExchangeClient (signed /exchange orders)
+│   │   └── trade_history.py     # fills + optional fill % via orderStatus
+│   └── management/commands/     # smoke_signing, info_snapshot, place_order, …
 │
 ├── signing/                     # Plain Python; no Django imports
 │   ├── __init__.py
@@ -64,14 +66,13 @@ Hyperliquid API
 ├── scripts/
 │   ├── generate_wallet.py       # new key + public key + address; optional --write-env
 │   ├── test_phase1.py           # automated Phase 1 checks (exit code)
-│   └── test_phase2.py           # Phase 2: live /info calls + info_snapshot (network)
-│
-└── (future) trading/services/exchange_client.py  # signed /exchange actions
+│   ├── test_phase2.py           # Phase 2: live /info calls + info_snapshot (network)
+│   └── test_phase3.py           # Phase 3: ExchangeClient + trade history (network)
 ```
 
 **Security:** The private key lives only in environment variables loaded at startup (`python-dotenv` in `config/settings.py`). Admin and models never hold key material.
 
-**Network:** `signing/env.py` is the single place that interprets `HYPERLIQUID_MAINNET` and `HYPERLIQUID_API_URL`. `config.settings.HYPERLIQUID_API_URL`, `InfoClient()`, and `SigningModule` (default) all use it. If `HYPERLIQUID_API_URL` is the official mainnet or testnet base URL, EIP-712 signing follows that URL so it cannot disagree with read-only calls. For a custom base URL (e.g. local), `HYPERLIQUID_MAINNET` still controls the signing domain. The `TradingAccount.use_testnet` admin field is metadata only until wired to env.
+**Network:** `signing/env.py` reads **only** environment variables (see `.env.example`): canonical `HYPERLIQUID_MAINNET_API_URL` / `HYPERLIQUID_TESTNET_API_URL`, optional `HYPERLIQUID_API_URL`, and `HYPERLIQUID_MAINNET`. There are no hardcoded API URLs in app code. `signing/required_env.py` lists keys required for deposit text and validation. `config.settings.HYPERLIQUID_API_URL`, `InfoClient()`, and `SigningModule` all use the same resolution. The `TradingAccount.use_testnet` admin field is metadata only until wired to env.
 
 ---
 
@@ -198,21 +199,46 @@ The first `InfoClient()` call can take a while while the SDK loads `meta` / `spo
 
 ---
 
-### Phase 3 — Orders (testnet first)
+### Phase 3 — Orders (mainnet + testnet via `.env`)
 
-**Goal:** Place and cancel orders via signed actions.
+**Goal:** Place and cancel orders on any listed perp or spot market; inspect trade history with optional fill %.
 
-**Tasks:**
+**Implemented:**
 
-1. `ExchangeClient` service using `SigningModule` + SDK `Exchange`
-2. Nonce: `int(time.time() * 1000)`
-3. Test on testnet URL first
+- `trading/services/exchange_client.py` — `ExchangeClient(SigningModule)` wrapping SDK `Exchange` with `settings.HYPERLIQUID_API_URL` / `signing/env.py` (SDK uses the same base URL for signing domain checks).
+- `place_limit_order`, `place_market_order` (IOC + slippage; reduce-only supported), `cancel_order`.
+- `trading/services/trade_history.py` — `userFills` with `_notional_usd`, grouping by `oid`, optional `orderStatus` + `filled_pct_of_orig_sz` when `--enrich`.
+- Commands: `place_order`, `cancel_order`, `trade_history`, `list_markets` (perp + spot names for `--coin`).
+- `python scripts/test_phase3.py` — validates wiring and report shape (network). Optional `PHASE3_PLACE_SMOKE=1` sends a **test** limit (use only on testnet / with care).
+
+**How to test Phase 3**
+
+```bash
+python scripts/test_phase3.py
+python manage.py list_markets
+python manage.py trade_history
+python manage.py trade_history --enrich --max-order-lookups 20
+```
+
+Place/cancel (real money risk on mainnet — prefer testnet in `.env`):
+
+```bash
+# testnet example: HYPERLIQUID_MAINNET=false or HYPERLIQUID_API_URL=https://api.hyperliquid-testnet.xyz
+python manage.py place_order --coin BTC --side buy --sz 0.001 --limit-px 30000 --tif Gtc
+python manage.py cancel_order --coin BTC --oid 123456789
+```
 
 ---
 
 ### Phase 4 — Withdrawals
 
 **Goal:** `withdraw3` (or current SDK action) with address validation and dry-run guard.
+
+**Implemented:**
+
+- `ExchangeClient.withdraw_to_wallet(amount, destination)` — checksummed EVM address via `eth_utils`.
+- `python manage.py withdraw --amount … --destination 0x…` — **dry-run by default**; `--execute` submits the signed withdrawal only if `HYPERLIQUID_REAL_MONEY_ACK=I_UNDERSTAND` is set in `.env`.
+- `python scripts/test_phase4.py` — validates withdraw wiring, dry-run output, and real-money guard (no live withdrawal unless you opt in manually).
 
 ---
 
@@ -237,6 +263,6 @@ Swap implementation inside `signing/signer.py` only; Django and service layers k
 
 - [x] Phase 1: Django runs, admin works, signing smoke command succeeds
 - [x] Phase 2: Read queries working
-- [ ] Phase 3: Place/cancel on testnet
-- [ ] Phase 4: Withdrawal flow
+- [x] Phase 3: Place/cancel + trade history (mainnet/testnet via env)
+- [x] Phase 4: Withdrawal flow (CLI + dry-run default + `test_phase4.py`)
 - [ ] `.env` in `.gitignore` verified before first commit

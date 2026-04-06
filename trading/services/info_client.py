@@ -1,5 +1,8 @@
 """
 Read-only Hyperliquid /info client. No signing, no private key — only address-based queries.
+
+`Info(..., skip_ws=True)` avoids a background WebSocket thread (appropriate for scripts).
+First use may hit the network to load meta; that can take a while.
 """
 from __future__ import annotations
 
@@ -23,6 +26,11 @@ class InfoClient:
         url = base_url if base_url is not None else default_base_url()
         self._info = Info(base_url=url, skip_ws=True, timeout=timeout)
         self.base_url = self._info.base_url
+
+    @property
+    def raw_info(self) -> Info:
+        """Underlying SDK `Info` (for advanced callers)."""
+        return self._info
 
     def get_clearinghouse_state(self, address: str, dex: str = "") -> Any:
         """Full perp clearinghouse payload (positions, margin summary, withdrawable, …)."""
@@ -80,3 +88,42 @@ class InfoClient:
             "deposits": self.get_deposits(address),
             "spot": self.get_spot_clearinghouse_state(address),
         }
+
+    def get_order_status(self, address: str, oid: int) -> Any:
+        return self._info.query_order_by_oid(address, oid)
+
+    def trade_history_report(
+        self,
+        address: str,
+        *,
+        enrich_order_status: bool = False,
+        max_order_lookups: int = 50,
+    ) -> dict[str, Any]:
+        # Lazy import keeps `trade_history` optional for callers that only need snapshots.
+        from trading.services.trade_history import build_trade_history_report
+
+        return build_trade_history_report(
+            self._info,
+            address,
+            enrich_order_status=enrich_order_status,
+            max_order_lookups=max_order_lookups,
+        )
+
+    def list_symbols(self) -> dict[str, Any]:
+        """Perp and spot instrument names as understood by the API (for `--coin`)."""
+        meta = self._info.meta()
+        spot = self._info.spot_meta()
+        perps = [u["name"] for u in meta.get("universe", []) if isinstance(u, dict) and "name" in u]
+        spots = [u["name"] for u in spot.get("universe", []) if isinstance(u, dict) and "name" in u]
+        return {"base_url": self.base_url, "perp": perps, "spot": spots}
+
+    def get_account_balances(self, address: str, dex: str = "") -> dict[str, Any]:
+        """Structured perp vs spot balances (see `trading.services.balances`)."""
+        from trading.services.balances import summarize_account_balances
+
+        return summarize_account_balances(self._info, address, dex=dex)
+
+    def get_account_balances(self, address: str, dex: str = "") -> dict[str, Any]:
+        from trading.services.balances import summarize_account_balances
+
+        return summarize_account_balances(self._info, address, dex=dex)

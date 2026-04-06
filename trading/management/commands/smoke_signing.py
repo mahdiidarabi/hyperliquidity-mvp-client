@@ -1,3 +1,4 @@
+"""Offline signing smoke test (no HTTP)."""
 import time
 
 from django.core.management.base import BaseCommand

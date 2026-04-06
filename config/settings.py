@@ -1,3 +1,9 @@
+"""
+Django settings for the Hyperliquid MVP client.
+
+Loads `.env` from the repo root before reading env vars. Hyperliquid API URL is
+resolved once via `signing.env` so management commands and app code use the same host.
+"""
 import os
 from pathlib import Path
 

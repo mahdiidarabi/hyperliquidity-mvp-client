@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Django's command-line utility for administrative tasks."""
+"""CLI entrypoint: `python manage.py <command>` (see README for trading commands)."""
 import os
 import sys
 

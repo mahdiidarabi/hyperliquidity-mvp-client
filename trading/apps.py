@@ -1,3 +1,4 @@
+"""Registers the `trading` Django app (models + management commands)."""
 from django.apps import AppConfig
 
 

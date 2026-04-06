@@ -1,3 +1,9 @@
+"""
+EIP-712 L1 signing for Hyperliquid actions.
+
+`SigningModule` is the only module that reads `PRIVATE_KEY` from the environment.
+Network (mainnet vs testnet) for signing matches `signing.env.hyperliquid_signing_is_mainnet`.
+"""
 import os
 from typing import Any
 
@@ -31,6 +37,11 @@ class SigningModule:
     @property
     def address(self) -> str:
         return self._account.address
+
+    @property
+    def wallet(self) -> LocalAccount:
+        """Underlying signer for SDK `Exchange` (same key material as address)."""
+        return self._account
 
     def sign_l1_action(
         self,

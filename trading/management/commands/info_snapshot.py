@@ -1,3 +1,4 @@
+"""Dump read-only account JSON (see `InfoClient.snapshot`)."""
 import json
 
 from django.conf import settings

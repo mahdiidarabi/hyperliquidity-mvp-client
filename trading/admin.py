@@ -1,3 +1,4 @@
+"""Django admin for `TradingAccount` (labels only; no secrets)."""
 from django.contrib import admin
 
 from trading.models import TradingAccount

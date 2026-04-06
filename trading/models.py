@@ -1,3 +1,4 @@
+"""Django models for non-secret metadata (optional labels in admin)."""
 from django.db import models
 
 

@@ -36,6 +36,15 @@ def main() -> int:
         return 1
 
     load_dotenv(env_path)
+    sys.path.insert(0, str(root))
+
+    from signing.required_env import missing_required_env_vars
+
+    miss = missing_required_env_vars()
+    if miss:
+        fail(f"Missing env vars (copy from .env.example): {', '.join(miss)}")
+        return 1
+
     raw = os.environ.get("PRIVATE_KEY")
     if not raw or not str(raw).strip():
         fail("PRIVATE_KEY is empty in .env")
@@ -47,7 +56,6 @@ def main() -> int:
         fail(f"Invalid PRIVATE_KEY: {e}")
         return 1
 
-    sys.path.insert(0, str(root))
     os.chdir(root)
 
     from signing import SigningModule

@@ -1,17 +1,23 @@
 """
-Hyperliquid network selection from environment (no Django).
+Hyperliquid network selection from environment (no Django, no hardcoded API URLs).
 
-- HYPERLIQUID_MAINNET: when HYPERLIQUID_API_URL is unset, picks mainnet vs testnet API base.
-- HYPERLIQUID_API_URL: optional override. If set to the official mainnet or testnet URL, signing
-  uses the matching EIP-712 domain so reads and writes stay consistent.
+Required variables are listed in `.env.example`. Canonical mainnet/testnet API bases are used
+to pick EIP-712 signing domain and to match the SDK’s internal checks when URLs align.
 """
 from __future__ import annotations
 
 import os
 
-from hyperliquid.utils.constants import MAINNET_API_URL, TESTNET_API_URL
-
 _MAINNET_TRUTHY = frozenset({"1", "true", "yes"})
+
+
+def _required(key: str) -> str:
+    v = (os.environ.get(key) or "").strip()
+    if not v:
+        raise RuntimeError(
+            f"Missing required environment variable {key}. Copy .env.example to .env and set it."
+        )
+    return v
 
 
 def env_flag_hyperliquid_mainnet() -> bool:
@@ -20,25 +26,32 @@ def env_flag_hyperliquid_mainnet() -> bool:
 
 
 def hyperliquid_api_base_url() -> str:
-    """HTTP base URL for Info / Exchange (no trailing slash)."""
+    """
+    Active HTTP API base (no trailing slash).
+
+    If HYPERLIQUID_API_URL is set, it wins. Otherwise uses HYPERLIQUID_MAINNET + canonical
+    HYPERLIQUID_MAINNET_API_URL / HYPERLIQUID_TESTNET_API_URL.
+    """
     explicit = (os.environ.get("HYPERLIQUID_API_URL") or "").strip()
     if explicit:
         return explicit.rstrip("/")
-    return MAINNET_API_URL if env_flag_hyperliquid_mainnet() else TESTNET_API_URL
+    m = _required("HYPERLIQUID_MAINNET_API_URL").rstrip("/")
+    t = _required("HYPERLIQUID_TESTNET_API_URL").rstrip("/")
+    return m if env_flag_hyperliquid_mainnet() else t
 
 
 def hyperliquid_signing_is_mainnet() -> bool:
     """
     Whether L1 actions use the mainnet EIP-712 domain.
 
-    If HYPERLIQUID_API_URL points at the official mainnet or testnet host, that wins.
-    Otherwise HYPERLIQUID_MAINNET decides (for custom / local URLs).
+    Compares the active API URL to HYPERLIQUID_MAINNET_API_URL / HYPERLIQUID_TESTNET_API_URL.
+    If neither matches (custom URL), falls back to HYPERLIQUID_MAINNET.
     """
-    explicit = (os.environ.get("HYPERLIQUID_API_URL") or "").strip()
-    if explicit:
-        u = explicit.rstrip("/").lower()
-        if u == MAINNET_API_URL.rstrip("/").lower():
-            return True
-        if u == TESTNET_API_URL.rstrip("/").lower():
-            return False
+    u = hyperliquid_api_base_url().lower()
+    m = _required("HYPERLIQUID_MAINNET_API_URL").rstrip("/").lower()
+    t = _required("HYPERLIQUID_TESTNET_API_URL").rstrip("/").lower()
+    if u == m:
+        return True
+    if u == t:
+        return False
     return env_flag_hyperliquid_mainnet()
