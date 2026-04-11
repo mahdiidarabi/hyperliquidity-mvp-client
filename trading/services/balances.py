@@ -67,6 +67,7 @@ def summarize_account_balances(info: Info, address: str, dex: str = "") -> dict[
 
     return {
         "address": address,
+        "perp_dex": dex,
         "perp": perp,
         "spot": spot,
     }

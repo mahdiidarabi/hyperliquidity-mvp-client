@@ -110,20 +110,46 @@ class InfoClient:
         )
 
     def list_symbols(self) -> dict[str, Any]:
-        """Perp and spot instrument names as understood by the API (for `--coin`)."""
-        meta = self._info.meta()
+        """Perp and spot instrument names as understood by the API (for `--coin`).
+
+        Perpetuals include the **default** DEX (`meta` with ``dex=""``) and every
+        **builder / HIP-3** DEX from `perpDexs` (e.g. ``xyz`` → coins like ``xyz:CL``).
+        Calling `meta()` without a dex only returns the primary universe; oil and other
+        deployed markets live under non-empty `dex` values.
+        """
         spot = self._info.spot_meta()
-        perps = [u["name"] for u in meta.get("universe", []) if isinstance(u, dict) and "name" in u]
         spots = [u["name"] for u in spot.get("universe", []) if isinstance(u, dict) and "name" in u]
-        return {"base_url": self.base_url, "perp": perps, "spot": spots}
+
+        perps: list[str] = []
+        perp_by_dex: list[dict[str, Any]] = []
+
+        main = self._info.meta(dex="")
+        main_names = [u["name"] for u in main.get("universe", []) if isinstance(u, dict) and "name" in u]
+        perps.extend(main_names)
+        perp_by_dex.append({"dex": "", "assets": main_names})
+
+        dex_list = self._info.perp_dexs()
+        if isinstance(dex_list, list):
+            for entry in dex_list:
+                if not isinstance(entry, dict):
+                    continue
+                dex_name = entry.get("name")
+                if not dex_name:
+                    continue
+                m = self._info.meta(dex=dex_name)
+                row = [u["name"] for u in m.get("universe", []) if isinstance(u, dict) and "name" in u]
+                perps.extend(row)
+                perp_by_dex.append({"dex": dex_name, "assets": row})
+
+        return {
+            "base_url": self.base_url,
+            "perp": perps,
+            "spot": spots,
+            "perp_by_dex": perp_by_dex,
+        }
 
     def get_account_balances(self, address: str, dex: str = "") -> dict[str, Any]:
         """Structured perp vs spot balances (see `trading.services.balances`)."""
-        from trading.services.balances import summarize_account_balances
-
-        return summarize_account_balances(self._info, address, dex=dex)
-
-    def get_account_balances(self, address: str, dex: str = "") -> dict[str, Any]:
         from trading.services.balances import summarize_account_balances
 
         return summarize_account_balances(self._info, address, dex=dex)

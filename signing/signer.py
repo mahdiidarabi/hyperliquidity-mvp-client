@@ -11,6 +11,7 @@ from eth_account import Account
 from eth_account.signers.local import LocalAccount
 from hyperliquid.utils.signing import (
     sign_l1_action as hl_sign_l1_action,
+    sign_send_asset_action as hl_sign_send_asset_action,
     sign_usd_class_transfer_action,
     sign_withdraw_from_bridge_action,
 )
@@ -66,3 +67,7 @@ class SigningModule:
 
     def sign_withdraw_from_bridge_action(self, action: dict[str, Any]) -> Any:
         return sign_withdraw_from_bridge_action(self._account, action, self._is_mainnet)
+
+    def sign_send_asset_action(self, action: dict[str, Any]) -> Any:
+        """User-signed EIP-712 action (not L1 phantom agent)."""
+        return hl_sign_send_asset_action(self._account, action, self._is_mainnet)

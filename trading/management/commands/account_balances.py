@@ -21,11 +21,17 @@ class Command(BaseCommand):
             default=None,
             help="Account (default: address from PRIVATE_KEY)",
         )
+        parser.add_argument(
+            "--dex",
+            type=str,
+            default="",
+            help='Perp DEX for clearinghouseState (default \"\" = primary; use e.g. xyz for builder DEX)',
+        )
         parser.add_argument("--indent", type=int, default=2)
 
     def handle(self, *args, **options):
         addr = options["address"] or SigningModule().address
         ic = InfoClient(base_url=settings.HYPERLIQUID_API_URL)
-        data = ic.get_account_balances(addr)
+        data = ic.get_account_balances(addr, dex=options["dex"])
         ind = options["indent"]
         self.stdout.write(json.dumps(data, default=str, indent=ind if ind > 0 else None))

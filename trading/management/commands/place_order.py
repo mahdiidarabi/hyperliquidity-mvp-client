@@ -1,5 +1,8 @@
 """CLI: place limit or market order via `ExchangeClient`."""
+from __future__ import annotations
+
 import json
+from typing import Any
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
@@ -30,16 +33,39 @@ class Command(BaseCommand):
         )
         parser.add_argument("--slippage", type=float, default=0.05, help="Market order slippage (default 0.05)")
         parser.add_argument("--reduce-only", action="store_true", help="Reduce-only flag")
+        parser.add_argument(
+            "--leverage",
+            type=int,
+            default=None,
+            help="If set, submit updateLeverage for this coin immediately before the order",
+        )
+        mx = parser.add_mutually_exclusive_group()
+        mx.add_argument(
+            "--isolated",
+            action="store_true",
+            help="Use with --leverage: isolated margin (isCross=false); required for many builder perps",
+        )
+        mx.add_argument(
+            "--cross",
+            action="store_true",
+            help="Use with --leverage: cross margin (isCross=true); default when neither flag is set",
+        )
 
     def handle(self, *args, **options):
         signer = SigningModule()
         client = ExchangeClient(signer, base_url=settings.HYPERLIQUID_API_URL)
         is_buy = options["side"] == "buy"
         ro = options["reduce_only"]
+        coin = options["coin"]
+
+        lev_out: dict[str, Any] | None = None
+        if options["leverage"] is not None:
+            is_cross = not options["isolated"]
+            lev_out = client.update_leverage(coin, options["leverage"], is_cross=is_cross)
 
         if options["market"]:
             result = client.place_market_order(
-                options["coin"],
+                coin,
                 is_buy,
                 options["sz"],
                 slippage=options["slippage"],
@@ -47,7 +73,7 @@ class Command(BaseCommand):
             )
         else:
             result = client.place_limit_order(
-                options["coin"],
+                coin,
                 is_buy,
                 options["sz"],
                 options["limit_px"],
@@ -55,4 +81,8 @@ class Command(BaseCommand):
                 reduce_only=ro,
             )
 
-        self.stdout.write(json.dumps(result, default=str, indent=2))
+        if lev_out is not None:
+            out = {"updateLeverage": lev_out, "order": result}
+        else:
+            out = result
+        self.stdout.write(json.dumps(out, default=str, indent=2))

@@ -13,6 +13,7 @@ from hyperliquid.api import API
 from hyperliquid.info import Info
 from hyperliquid.utils.signing import (
     OrderType,
+    float_to_usd_int,
     get_timestamp_ms,
     order_request_to_order_wire,
     order_wires_to_order_action,
@@ -22,6 +23,23 @@ from signing import SigningModule
 from signing.env import hyperliquid_api_base_url
 
 Tif = Literal["Alo", "Ioc", "Gtc"]
+
+
+def _perp_dex_ids_for_info(base_url: str, timeout: float | None) -> list[str]:
+    """
+    Primary perp DEX (``""``) plus every builder-deployed DEX name from ``perpDexs``.
+
+    The SDK's ``Info`` only loads ``meta(dex="")`` by default; coins like ``xyz:CL`` need
+    the corresponding dex (e.g. ``"xyz"``) included so ``name_to_asset`` works.
+    """
+    api = API(base_url=base_url, timeout=timeout)
+    out: list[str] = [""]
+    raw = api.post("/info", {"type": "perpDexs"})
+    if isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, dict) and entry.get("name"):
+                out.append(entry["name"])
+    return out
 
 
 def validate_evm_address(addr: str) -> str:
@@ -47,8 +65,24 @@ class ExchangeClient:
         self._signer = signer
         self._api = API(base_url=url, timeout=timeout)
         # skip_ws=True: CLI/services do one-shot calls and do not need a background websocket.
-        self._info = Info(base_url=url, skip_ws=True, timeout=timeout)
+        # Load all perp DEX universes (default Info only loads dex=""; builder markets need e.g. "xyz").
+        self._info = Info(
+            base_url=url,
+            skip_ws=True,
+            timeout=timeout,
+            perp_dexs=_perp_dex_ids_for_info(url, timeout),
+        )
         self.base_url = self._api.base_url
+
+    def _canonical_usdc_token_string(self) -> str:
+        """``tokenName:tokenId`` for canonical USDC (``sendAsset`` / docs)."""
+        sm = self._info.spot_meta()
+        for t in sm.get("tokens", []):
+            if isinstance(t, dict) and t.get("name") == "USDC" and t.get("isCanonical"):
+                tid = t.get("tokenId")
+                if isinstance(tid, str) and tid:
+                    return f"USDC:{tid}"
+        raise RuntimeError("canonical USDC token not found in spotMeta")
 
     def _post_action(self, action: dict[str, Any], signature: Any, nonce: int) -> Any:
         payload = {
@@ -76,6 +110,88 @@ class ExchangeClient:
         is_spot = asset >= 10_000
         px *= (1 + slippage) if is_buy else (1 - slippage)
         return round(float(f"{px:.5g}"), (6 if not is_spot else 8) - self._info.asset_to_sz_decimals[asset])
+
+    def update_leverage(
+        self,
+        coin: str,
+        leverage: int,
+        *,
+        is_cross: bool = True,
+    ) -> Any:
+        """
+        Set per-asset leverage (``updateLeverage``).
+
+        Builder / isolated-only perps (e.g. ``xyz:BRENTOIL``) require ``is_cross=False``.
+        """
+        if leverage < 1:
+            raise ValueError("leverage must be >= 1")
+        nonce = get_timestamp_ms()
+        action = {
+            "type": "updateLeverage",
+            "asset": self._info.name_to_asset(coin),
+            "isCross": is_cross,
+            "leverage": leverage,
+        }
+        signature = self._signer.sign_l1_action(action, nonce, vault_address=None)
+        return self._post_action(action, signature, nonce)
+
+    def update_isolated_margin(
+        self,
+        coin: str,
+        amount_usd: float,
+        *,
+        add: bool = True,
+    ) -> Any:
+        """
+        Move USDC into or out of isolated margin for this asset (``updateIsolatedMargin``).
+
+        Collateral must already sit in **this market's perp DEX** margin (e.g. move USDC from
+        the primary perp DEX to ``xyz`` first via :meth:`send_usdc_between_perp_dexes`).
+        ``add=True`` increases isolated collateral from that DEX's available balance.
+        """
+        if amount_usd <= 0:
+            raise ValueError("amount_usd must be positive")
+        nonce = get_timestamp_ms()
+        action = {
+            "type": "updateIsolatedMargin",
+            "asset": self._info.name_to_asset(coin),
+            "isBuy": add,
+            "ntli": float_to_usd_int(amount_usd),
+        }
+        signature = self._signer.sign_l1_action(action, nonce, vault_address=None)
+        return self._post_action(action, signature, nonce)
+
+    def send_usdc_between_perp_dexes(
+        self,
+        amount: float,
+        *,
+        source_dex: str,
+        destination_dex: str,
+        destination: str | None = None,
+    ) -> Any:
+        """
+        Move USDC collateral between perp DEX books (``sendAsset``).
+
+        Use ``source_dex=\"\"`` for the default USDC perp DEX and ``destination_dex=\"xyz\"``
+        (or another builder name) before trading ``xyz:*`` markets. Documented in
+        `Send Asset <https://hyperliquid.gitbook.io/hyperliquid-docs/for-developers/api/exchange-endpoint>`_.
+        """
+        if amount <= 0:
+            raise ValueError("amount must be positive")
+        dest = destination if destination is not None else self._signer.address
+        nonce = get_timestamp_ms()
+        action = {
+            "type": "sendAsset",
+            "destination": dest,
+            "sourceDex": source_dex,
+            "destinationDex": destination_dex,
+            "token": self._canonical_usdc_token_string(),
+            "amount": str(amount),
+            "fromSubAccount": "",
+            "nonce": nonce,
+        }
+        signature = self._signer.sign_send_asset_action(action)
+        return self._post_action(action, signature, nonce)
 
     def place_limit_order(
         self,
