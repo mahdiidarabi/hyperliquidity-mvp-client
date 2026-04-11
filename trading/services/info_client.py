@@ -6,6 +6,7 @@ First use may hit the network to load meta; that can take a while.
 """
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from hyperliquid.info import Info
@@ -47,6 +48,21 @@ class InfoClient:
     def get_trade_fills(self, address: str) -> Any:
         return self._info.user_fills(address)
 
+    def get_non_funding_ledger(
+        self,
+        address: str,
+        *,
+        start_time_ms: int = 0,
+        end_time_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """
+        Raw rows from ``userNonFundingLedgerUpdates`` (deposits, withdraws, transfers, …).
+        """
+        raw = self._info.user_non_funding_ledger_updates(address, start_time_ms, end_time_ms)
+        if not isinstance(raw, list):
+            return []
+        return [r for r in raw if isinstance(r, dict)]
+
     def get_deposits(
         self,
         address: str,
@@ -58,19 +74,36 @@ class InfoClient:
         Bridge deposits from non-funding ledger updates (`delta.type == "deposit"`).
         Hyperliquid does not expose a separate `userDeposits` info method in the public API.
         """
-        raw = self._info.user_non_funding_ledger_updates(
-            address, start_time_ms, end_time_ms
-        )
-        if not isinstance(raw, list):
-            return []
         out: list[dict[str, Any]] = []
-        for row in raw:
-            if not isinstance(row, dict):
-                continue
+        for row in self.get_non_funding_ledger(address, start_time_ms=start_time_ms, end_time_ms=end_time_ms):
             delta = row.get("delta")
             if isinstance(delta, dict) and delta.get("type") == "deposit":
                 out.append(row)
         return out
+
+    def get_withdrawals(
+        self,
+        address: str,
+        *,
+        start_time_ms: int = 0,
+        end_time_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Completed withdrawals from ledger updates (`delta.type == "withdraw"`)."""
+        out: list[dict[str, Any]] = []
+        for row in self.get_non_funding_ledger(address, start_time_ms=start_time_ms, end_time_ms=end_time_ms):
+            delta = row.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "withdraw":
+                out.append(row)
+        return out
+
+    @staticmethod
+    def default_start_ms_for_days(days: int) -> int:
+        """``startTime`` for ``userNonFundingLedgerUpdates`` (ms since epoch). ``0`` = full history."""
+        if days < 0:
+            raise ValueError("days must be non-negative")
+        if days == 0:
+            return 0
+        return int(time.time() * 1000) - days * 86_400_000
 
     def get_spot_clearinghouse_state(self, address: str) -> Any:
         """Spot balances / spot clearinghouse state (includes USDC and tokens)."""

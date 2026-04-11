@@ -1,268 +1,239 @@
-# Hyperliquid Client — MVP Implementation Plan (Django)
+# Hyperliquid MVP Client — Implementation & Reference
 
-## Goal
-
-Build a minimal **Django** app that wraps a Python Hyperliquid client:
-
-- Loads a private key from `.env` (never stored in the database, never logged)
-- Derives the wallet address locally
-- Signs write actions with EIP-712 via the official SDK’s signing helpers
-- Keeps signing in an isolated, swappable `signing/` package (usable outside Django)
-- Uses **simple models and Django admin** only for non-secret metadata (labels, testnet flag)
-- Eventually supports: account info, deposit tracking, trading, withdrawals, trade history
+This document is the **technical reference** for `hyperliquidity-mvp-client`: architecture, env, modules, Hyperliquid-specific behavior, and phased delivery. Use it (or excerpts) as **context in other chats** alongside [README.md](README.md).
 
 ---
 
-## Core Concepts
+## Purpose
 
-- **Your account = your wallet address** (derived from the private key in `.env`)
-- **All write actions = EIP-712 signed messages** posted to `/exchange`
-- **All read actions = unsigned POST requests** to `/info`
-- **Nonce = current timestamp in milliseconds** (Hyperliquid requirement)
+Minimal **Django** app that:
+
+- Loads **`PRIVATE_KEY` only from `.env`** (never DB, never committed).
+- Derives the wallet address; signs writes via **EIP-712** using the official **`hyperliquid-python-sdk`** helpers.
+- Separates **`signing/`** (framework-free) from **`trading/`** (Django + services + CLI).
+- Reads **`/info`** via **`InfoClient`**; posts signed payloads to **`/exchange`** via **`ExchangeClient`** + **`SigningModule`**.
+- Uses **Django admin** only for non-secret metadata (`TradingAccount` labels).
+
+---
+
+## Quick context (for AI / copy-paste)
+
+- **Stack:** Django, `hyperliquid-python-sdk`, `eth_account`, `python-dotenv`, SQLite dev DB.
+- **API base:** From `.env` only — `HYPERLIQUID_MAINNET_API_URL`, `HYPERLIQUID_TESTNET_API_URL`, optional `HYPERLIQUID_API_URL`, `HYPERLIQUID_MAINNET`. Resolved in `signing/env.py`; exposed as `settings.HYPERLIQUID_API_URL`.
+- **Signing:** `SigningModule` in `signing/signer.py` — only reader of `PRIVATE_KEY`.
+  - **L1 actions** (phantom agent): `sign_l1_action` — orders, cancel, `updateLeverage`, `updateIsolatedMargin`, `usdClassTransfer`-style payloads posted with `nonce` in body.
+  - **User-signed typed data:** `sign_withdraw_from_bridge_action` (`withdraw3`), `sign_usd_class_transfer_action` (`usdClassTransfer`), `sign_send_asset_action` (`sendAsset`).
+- **Services:** `trading/services/info_client.py` (`InfoClient`), `exchange_client.py` (`ExchangeClient`), `balances.py`, `trade_history.py`; `trading/deposit_info.py` for wallet deposit text.
+- **CLI:** `trading/management/commands/*.py` — see [Management commands](#management-commands) below.
+- **Tests:** `scripts/test_phase1.py` … `test_phase4.py`.
+- **Hyperliquid gotchas:**
+  - **`list_markets`** merges `meta(dex="")` + `meta(dex=name)` for each builder DEX from `perpDexs` — builder coins are `xyz:SYMBOL`.
+  - **`ExchangeClient`** constructs `Info(perp_dexs=[""]+builder names)` so `name_to_asset("xyz:…")` works.
+  - **Builder DEX margin:** USDC on primary perp (`dex=""`) is **not** on the `xyz` book — use **`send_usdc_between_perp_dexes`** (`sendAsset`) before `update_isolated_margin` on `xyz:*` if funds are only on the default DEX.
+  - **Bridge (Bridge2 docs):** deposits are often credited in about a minute; withdrawals after `withdraw3` are often visible on Arbitrum in a few minutes.
+  - **`deposit_history` / `withdraw_history`:** `userNonFundingLedgerUpdates` — **finalized** ledger rows only; pending chain txs may be absent until credited.
+
+---
+
+## Core API model (Hyperliquid)
+
+- **Reads:** `POST https://…/info` with typed body (`clearinghouseState`, `userFills`, `userNonFundingLedgerUpdates`, …).
+- **Writes:** `POST https://…/exchange` with `action`, `nonce` (ms timestamp), `signature`, optional `vaultAddress`, `expiresAfter`.
+- **Nonce:** Use **current time in milliseconds** for exchange actions (SDK `get_timestamp_ms()` pattern).
 
 ---
 
 ## Architecture
 
 ```
-Django (admin + optional views later)
-        ↓
-trading/services (InfoClient today; Exchange later)   ← info + (future) exchange
-        ↓
-SigningModule (signing/signer.py)              ← reads PRIVATE_KEY from env; EIP-712
-        ↓
-Hyperliquid API
-  https://api.hyperliquid.xyz (mainnet)
-  https://api.hyperliquid-testnet.xyz (testnet)
+Django (config/, trading/, manage.py)
+    ↓
+InfoClient / ExchangeClient (trading/services/)
+    ↓
+SigningModule (signing/signer.py)  ← only module reading PRIVATE_KEY
+    ↓
+Hyperliquid HTTP API (/info, /exchange)
 ```
 
-### Repository Layout
+- **`ExchangeClient`** builds action dicts, calls **`SigningModule`**, then **`API.post("/exchange", payload)`** — it does **not** embed wallet logic like the SDK’s high-level `Exchange` class for everything; it mirrors the **sign → post** boundary explicitly.
+- **`Info`** is constructed with **`skip_ws=True`** and full **`perp_dexs`** list so multi-DEX metadata resolves.
+
+---
+
+## Environment variables
+
+**Source of truth:** [.env.example](.env.example). Required keys are also listed in `signing/required_env.py` where applicable.
+
+| Variable | Role |
+|----------|------|
+| `PRIVATE_KEY` | Hex private key for signing. |
+| `HYPERLIQUID_MAINNET_API_URL` | Canonical mainnet API URL. |
+| `HYPERLIQUID_TESTNET_API_URL` | Canonical testnet API URL. |
+| `HYPERLIQUID_API_URL` | Optional override; if unset, `HYPERLIQUID_MAINNET` picks canonical URL. |
+| `HYPERLIQUID_MAINNET` | Boolean when `HYPERLIQUID_API_URL` unset. |
+| `HYPERLIQUID_DOCS_URL` | Docs URL string for `wallet_info`. |
+| `DEPOSIT_USDC_LAYER2_NAME` | Human label (e.g. Arbitrum One). |
+| `DEPOSIT_ARBITRUM_CHAIN_ID` | Chain id string (e.g. `42161`). |
+| `HYPERLIQUID_REAL_MONEY_ACK` | Must be `I_UNDERSTAND` for `withdraw --execute`. |
+| `DJANGO_SECRET_KEY` | Optional Django secret. |
+
+---
+
+## Repository layout (current)
 
 ```
 .
-├── manage.py
-├── requirements.txt
-├── .env.example
-├── .env                         # PRIVATE_KEY=0x...  ← never committed
-│
-├── config/                      # Django project settings, urls, wsgi
-│   ├── settings.py
-│   └── ...
-│
-├── trading/                     # Django app — simple models + admin
-│   ├── models.py                # TradingAccount (metadata only)
+├── config/                 # Django project; settings loads dotenv, HYPERLIQUID_API_URL
+├── signing/
+│   ├── env.py              # URL + mainnet flag for signing alignment
+│   ├── required_env.py     # Required keys for tooling / deposit validation
+│   └── signer.py           # SigningModule
+├── trading/
+│   ├── models.py           # TradingAccount (metadata)
 │   ├── admin.py
+│   ├── deposit_info.py     # Deposit network summary for wallet_info
 │   ├── services/
-│   │   ├── info_client.py       # InfoClient (read-only /info)
-│   │   ├── exchange_client.py   # ExchangeClient (signed /exchange orders)
-│   │   └── trade_history.py     # fills + optional fill % via orderStatus
-│   └── management/commands/     # smoke_signing, info_snapshot, place_order, …
-│
-├── signing/                     # Plain Python; no Django imports
-│   ├── __init__.py
-│   ├── env.py                   # HYPERLIQUID_MAINNET / HYPERLIQUID_API_URL → URL + signing domain
-│   └── signer.py                # SigningModule
-│
-├── scripts/
-│   ├── generate_wallet.py       # new key + public key + address; optional --write-env
-│   ├── test_phase1.py           # automated Phase 1 checks (exit code)
-│   ├── test_phase2.py           # Phase 2: live /info calls + info_snapshot (network)
-│   └── test_phase3.py           # Phase 3: ExchangeClient + trade history (network)
-```
-
-**Security:** The private key lives only in environment variables loaded at startup (`python-dotenv` in `config/settings.py`). Admin and models never hold key material.
-
-**Network:** `signing/env.py` reads **only** environment variables (see `.env.example`): canonical `HYPERLIQUID_MAINNET_API_URL` / `HYPERLIQUID_TESTNET_API_URL`, optional `HYPERLIQUID_API_URL`, and `HYPERLIQUID_MAINNET`. There are no hardcoded API URLs in app code. `signing/required_env.py` lists keys required for deposit text and validation. `config.settings.HYPERLIQUID_API_URL`, `InfoClient()`, and `SigningModule` all use the same resolution. The `TradingAccount.use_testnet` admin field is metadata only until wired to env.
-
----
-
-## Tech Stack
-
-| Concern | Tool |
-|--------|------|
-| Web / admin | Django 5.x (LTS track: 4.2+ compatible) |
-| Hyperliquid SDK | `hyperliquid-python-sdk` |
-| Signing | `hyperliquid.utils.signing.sign_l1_action` + `eth_account` |
-| Key loading | `python-dotenv` |
-| DB (dev) | SQLite (`db.sqlite3`, gitignored) |
-
-Install:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
-cp .env.example .env        # then set PRIVATE_KEY
-python manage.py migrate
-python manage.py createsuperuser
-python manage.py runserver
+│   │   ├── info_client.py  # InfoClient + list_symbols, ledger helpers, …
+│   │   ├── exchange_client.py
+│   │   ├── balances.py
+│   │   └── trade_history.py
+│   └── management/commands/
+└── scripts/
+    ├── generate_wallet.py
+    └── test_phase1.py … test_phase4.py
 ```
 
 ---
 
-## SigningModule (Modular Boundary)
+## SigningModule (`signing/signer.py`)
 
-The only place the private key string is read from the environment. Callers pass `action`, `nonce`, and optional vault address; the module returns the `signature` dict expected by the API payload.
+| Method | Used for |
+|--------|----------|
+| `sign_l1_action(action, nonce, vault_address?)` | Order, cancel, `updateLeverage`, `updateIsolatedMargin` |
+| `sign_withdraw_from_bridge_action(action)` | `withdraw3` |
+| `sign_usd_class_transfer_action(action)` | Spot ↔ perp `usdClassTransfer` |
+| `sign_send_asset_action(action)` | `sendAsset` (perp DEX ↔ perp DEX USDC) |
 
-```python
-# signing/signer.py — concept
-
-class SigningModule:
-    """Isolated signing boundary. Replace internals later (HSM, vault) without touching Django views."""
-
-    def __init__(self, *, is_mainnet: bool = True, expires_after: int | None = None):
-        ...
-
-    @property
-    def address(self) -> str: ...
-
-    def sign_l1_action(
-        self, action: dict, nonce: int, vault_address: str | None = None
-    ) -> dict: ...
-```
-
-`Exchange` code (future phase) receives a `SigningModule` or the underlying `LocalAccount` only through explicit wiring — not from the database.
+`expires_after` optional on `SigningModule` constructor; passed into L1 sign helper.
 
 ---
 
-## Implementation Phases
+## InfoClient (`trading/services/info_client.py`)
 
-### Phase 1 — Django skeleton + SigningModule
+Thin wrapper over **`hyperliquid.info.Info`** (`skip_ws=True`).
 
-**Goal:** Runnable Django project, admin for metadata, env-based key, signing smoke check.
+Notable:
 
-**Tasks:**
-
-1. `requirements.txt`, `.env.example`, ensure `.gitignore` covers `.env` and `db.sqlite3`
-2. Django project `config` and app `trading`
-3. `TradingAccount` model: `name`, `use_testnet`, `created_at` (no secrets)
-4. Register model in admin
-5. `signing/signer.py`: load `PRIVATE_KEY`, expose `address`, delegate `sign_l1_action` to the SDK
-6. Management command `smoke_signing`: print wallet address; optionally produce a signature for a minimal L1 action (e.g. `scheduleCancel`) without posting
-
-**How to test Phase 1**
-
-1. Generate a fresh keypair and write `PRIVATE_KEY` to `.env`:
-
-   ```bash
-   python scripts/generate_wallet.py --write-env
-   ```
-
-   Without `--write-env`, the script only prints `private_key`, `public_key` (uncompressed secp256k1 hex), and `address`; copy `PRIVATE_KEY=...` into `.env` yourself.
-
-2. Run the automated verifier (checks `eth_account` vs `SigningModule` address, L1 sign shape, and `manage.py smoke_signing`):
-
-   ```bash
-   python scripts/test_phase1.py
-   ```
-
-   Exit code `0` means Phase 1 is behaving correctly; non-zero prints what failed.
-
-**Phase output (example):**
-
-```
-Wallet address: 0xYourDerivedAddress
-L1 signature produced (smoke): ok
-```
+- **`list_symbols()`** — `perp`, `spot`, **`perp_by_dex`** (primary + each `perpDexs` name).
+- **`get_non_funding_ledger`**, **`get_deposits`**, **`get_withdrawals`** — `userNonFundingLedgerUpdates`.
+- **`get_account_balances`** — uses `summarize_account_balances` (`balances.py`); optional **`dex`** for clearinghouse.
+- **`snapshot`**, **`trade_history_report`**, **`get_order_status`**, etc.
 
 ---
 
-### Phase 2 — Read-only info queries
+## ExchangeClient (`trading/services/exchange_client.py`)
 
-**Goal:** Fetch account state without signing.
+- **`place_limit_order`**, **`place_market_order`** (IOC + slippage from mid).
+- **`cancel_order`**
+- **`update_leverage`**, **`update_isolated_margin`**
+- **`send_usdc_between_perp_dexes`** — `sendAsset`; canonical USDC token string from `spotMeta`.
+- **`usd_class_transfer`**, **`withdraw_to_wallet`**
 
-**Tasks:**
-
-1. Add `trading/services/info_client.py` (or similar) wrapping `hyperliquid.info.Info`
-2. Methods: positions, open orders, fills, deposits, spot balances
-3. Management command or admin action to dump read-only snapshot (optional)
-
-**Implemented:**
-
-- `trading/services/info_client.py` — `InfoClient` with `skip_ws=True`, `HYPERLIQUID_API_URL` / mainnet flag from env or `settings.HYPERLIQUID_API_URL`
-- Methods: `get_clearinghouse_state`, `get_positions`, `get_open_orders`, `get_trade_fills`, `get_deposits` (ledger rows with `delta.type == "deposit"`), `get_spot_clearinghouse_state`, `snapshot`
-- `python manage.py info_snapshot` — JSON dump (default address = wallet from `PRIVATE_KEY`; override with `--address`)
-
-**How to test Phase 2** (requires outbound HTTPS to Hyperliquid):
-
-```bash
-python scripts/test_phase2.py
-```
-
-Also:
-
-```bash
-python manage.py info_snapshot
-```
-
-The first `InfoClient()` call can take a while while the SDK loads `meta` / `spotMeta` over the network.
+Constructs **`Info(..., perp_dexs=_perp_dex_ids_for_info(...))`** so all builder universe names resolve.
 
 ---
 
-### Phase 3 — Orders (mainnet + testnet via `.env`)
+## Management commands
 
-**Goal:** Place and cancel orders on any listed perp or spot market; inspect trade history with optional fill %.
-
-**Implemented:**
-
-- `trading/services/exchange_client.py` — `ExchangeClient(SigningModule)` wrapping SDK `Exchange` with `settings.HYPERLIQUID_API_URL` / `signing/env.py` (SDK uses the same base URL for signing domain checks).
-- `place_limit_order`, `place_market_order` (IOC + slippage; reduce-only supported), `cancel_order`.
-- `trading/services/trade_history.py` — `userFills` with `_notional_usd`, grouping by `oid`, optional `orderStatus` + `filled_pct_of_orig_sz` when `--enrich`.
-- Commands: `place_order`, `cancel_order`, `trade_history`, `list_markets` (perp + spot names for `--coin`).
-- `python scripts/test_phase3.py` — validates wiring and report shape (network). Optional `PHASE3_PLACE_SMOKE=1` sends a **test** limit (use only on testnet / with care).
-
-**How to test Phase 3**
-
-```bash
-python scripts/test_phase3.py
-python manage.py list_markets
-python manage.py trade_history
-python manage.py trade_history --enrich --max-order-lookups 20
-```
-
-Place/cancel (real money risk on mainnet — prefer testnet in `.env`):
-
-```bash
-# testnet example: HYPERLIQUID_MAINNET=false or HYPERLIQUID_API_URL=https://api.hyperliquid-testnet.xyz
-python manage.py place_order --coin BTC --side buy --sz 0.001 --limit-px 30000 --tif Gtc
-python manage.py cancel_order --coin BTC --oid 123456789
-```
+| Command | Purpose |
+|---------|---------|
+| `smoke_signing` | Offline L1 sign smoke |
+| `wallet_info` | Address + deposit help |
+| `account_balances` | Perp + spot; `--dex` for builder clearinghouse |
+| `list_markets` | Perp/spot names + `perp_by_dex` |
+| `info_snapshot` | Full read-only snapshot |
+| `trade_history` | Fills + optional `--enrich` |
+| `deposit_history` | Ledger deposits (`--days`) |
+| `withdraw_history` | Ledger withdraws (`--days`) |
+| `place_order` | Limit or market; optional `--leverage`, `--isolated` / `--cross` |
+| `cancel_order` | By `coin` + `oid` |
+| `update_leverage` | Standalone `updateLeverage` |
+| `update_isolated_margin` | `updateIsolatedMargin` |
+| `send_perp_usdc` | `sendAsset` between perp DEX books |
+| `transfer_usd_class` | Spot ↔ perp |
+| `withdraw` | `withdraw3`; dry-run unless `--execute` |
 
 ---
+
+## Hyperliquid operational notes
+
+1. **`--limit-px` vs `--market`** on `place_order` — mutually exclusive.
+2. **Minimum order notional** — often ~$10 on many perps; API returns explicit errors.
+3. **Builder perps** — isolated / noCross: fund **`xyz`** book first, then isolated margin, then trade (see README use case).
+4. **Cancel** — only **open** orders; filled trades require a **new** order to close (e.g. `reduce-only` opposite side).
+5. **Ledger history** — not a mempool view; pending deposits/withdrawals may be missing until finalized.
+
+---
+
+## Implementation phases (delivery history)
+
+### Phase 1 — Django + SigningModule
+
+Runnable Django project; `SigningModule`; `smoke_signing`; `scripts/generate_wallet.py`, `scripts/test_phase1.py`.
+
+### Phase 2 — Read-only `/info`
+
+`InfoClient`, `info_snapshot`, deposits from ledger, `scripts/test_phase2.py`.
+
+### Phase 3 — Trading + history
+
+`ExchangeClient` (orders, cancel, leverage, isolated margin, `sendAsset`, spot↔perp), `trade_history`, `list_markets` (multi-DEX), `place_order` / `cancel_order` / `update_leverage` / `update_isolated_margin` / `send_perp_usdc`, `scripts/test_phase3.py`.
 
 ### Phase 4 — Withdrawals
 
-**Goal:** `withdraw3` (or current SDK action) with address validation and dry-run guard.
-
-**Implemented:**
-
-- `ExchangeClient.withdraw_to_wallet(amount, destination)` — checksummed EVM address via `eth_utils`.
-- `python manage.py withdraw --amount … --destination 0x…` — **dry-run by default**; `--execute` submits the signed withdrawal only if `HYPERLIQUID_REAL_MONEY_ACK=I_UNDERSTAND` is set in `.env`.
-- `python scripts/test_phase4.py` — validates withdraw wiring, dry-run output, and real-money guard (no live withdrawal unless you opt in manually).
+`withdraw_to_wallet`, `manage.py withdraw` (dry-run default, `--execute` + `HYPERLIQUID_REAL_MONEY_ACK`), `scripts/test_phase4.py`.
 
 ---
 
-## Security Rules
+## Security rules
 
 | Rule | Detail |
 |------|--------|
-| `.env` never committed | `.gitignore` includes `.env` |
-| Key not in DB | Models store labels/flags only |
-| Key never logged | No logging of key, raw signatures, or full signed payloads in production code |
-| Testnet first | New write flows on testnet before mainnet |
+| `.env` gitignored | Never commit secrets |
+| No key in DB | `TradingAccount` is labels only |
+| Testnet first | For new flows |
+| `withdraw --execute` | Explicit env ack |
 
 ---
 
-## Future: Remote signing
+## Testing scripts
 
-Swap implementation inside `signing/signer.py` only; Django and service layers keep the same interface.
+| Script | What it checks |
+|--------|----------------|
+| `test_phase1.py` | Key, `SigningModule`, `smoke_signing` |
+| `test_phase2.py` | `InfoClient` / `info_snapshot` (network) |
+| `test_phase3.py` | `ExchangeClient` URL alignment, `trade_history_report` (optional live order via env) |
+| `test_phase4.py` | Withdraw dry-run, `--execute` blocked without ack |
 
 ---
 
-## MVP Checklist
+## Future work
 
-- [x] Phase 1: Django runs, admin works, signing smoke command succeeds
-- [x] Phase 2: Read queries working
-- [x] Phase 3: Place/cancel + trade history (mainnet/testnet via env)
-- [x] Phase 4: Withdrawal flow (CLI + dry-run default + `test_phase4.py`)
-- [ ] `.env` in `.gitignore` verified before first commit
+- Remote / HSM signing: replace internals of `SigningModule` only; keep the same public methods.
+
+---
+
+## MVP checklist
+
+- [x] Phase 1: Django, admin, signing smoke
+- [x] Phase 2: Read `/info`
+- [x] Phase 3: Trade, multi-DEX markets, leverage, isolated, sendAsset, history commands
+- [x] Phase 4: Withdraw with guards
+- [x] Ledger deposit/withdraw history CLI
+- [ ] Verify `.gitignore` excludes `.env` before publishing
+
+---
+
+## User flow (summary)
+
+See **[README.md — End-to-end user flow](README.md#end-to-end-user-flow)** for the step table (key → deposit → balances → spot/perp → trade → history → cancel → withdraw).
